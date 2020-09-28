@@ -194,16 +194,19 @@ void modesInitPLUTOSDR(void) {
     int device_count;
 
     printf("* Acquiring IIO context\n");
-    //Modes.ctx = iio_create_default_context();
-    Modes.ctx = iio_create_network_context("pluto.local");
+    Modes.ctx = iio_create_local_context();
+    if (Modes.ctx == NULL)
+        Modes.ctx = iio_create_network_context("pluto.local");
+    if (!Modes.ctx) {
+        fprintf(stderr, "No supported PLUTOSDR devices found.\n");
+        exit(1);
+    }
 
     device_count = iio_context_get_devices_count(Modes.ctx);
     if (!device_count) {
         fprintf(stderr, "No supported PLUTOSDR devices found.\n");
         exit(1);
     }
-
-    fprintf(stderr, "Found %d device(s):\n", device_count);
 
     printf("* Acquiring AD9361 streaming devices\n");
 

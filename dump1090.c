@@ -68,7 +68,6 @@ void modesInitConfig(void) {
     // Now initialise things that should not be 0/NULL to their defaults
     Modes.gain                    = MODES_MAX_GAIN;
     Modes.freq                    = MODES_DEFAULT_FREQ;
-    Modes.ppm_error               = MODES_DEFAULT_PPM;
     Modes.check_crc               = 1;
     Modes.net_heartbeat_rate      = MODES_NET_HEARTBEAT_RATE;
     Modes.net_output_sbs_port     = MODES_NET_OUTPUT_SBS_PORT;
@@ -191,56 +190,80 @@ void modesInit(void) {
 //
 // =============================== RTLSDR handling ==========================
 //
-void modesInitRTLSDR(void) {
-    int j;
+void modesInitPLUTOSDR(void) {
     int device_count;
-    char vendor[256], product[256], serial[256];
 
-    device_count = rtlsdr_get_device_count();
+    printf("* Acquiring IIO context\n");
+    //Modes.ctx = iio_create_default_context();
+    Modes.ctx = iio_create_network_context("pluto.local");
+
+    device_count = iio_context_get_devices_count(Modes.ctx);
     if (!device_count) {
-        fprintf(stderr, "No supported RTLSDR devices found.\n");
+        fprintf(stderr, "No supported PLUTOSDR devices found.\n");
         exit(1);
     }
 
     fprintf(stderr, "Found %d device(s):\n", device_count);
-    for (j = 0; j < device_count; j++) {
-        rtlsdr_get_device_usb_strings(j, vendor, product, serial);
-        fprintf(stderr, "%d: %s, %s, SN: %s %s\n", j, vendor, product, serial,
-            (j == Modes.dev_index) ? "(currently selected)" : "");
-    }
 
-    if (rtlsdr_open(&Modes.dev, Modes.dev_index) < 0) {
-        fprintf(stderr, "Error opening the RTLSDR device: %s\n",
-            strerror(errno));
+    printf("* Acquiring AD9361 streaming devices\n");
+
+    Modes.dev = iio_context_find_device(Modes.ctx, "cf-ad9361-lpc");
+
+    if (Modes.dev == NULL) {
+        fprintf(stderr, "Error opening the PLUTOSDR device: %s\n",
+                strerror(errno));
         exit(1);
     }
 
-    // Set gain, frequency, sample rate, and reset the device
-    rtlsdr_set_tuner_gain_mode(Modes.dev,
-        (Modes.gain == MODES_AUTO_GAIN) ? 0 : 1);
-    if (Modes.gain != MODES_AUTO_GAIN) {
-        if (Modes.gain == MODES_MAX_GAIN) {
-            // Find the maximum gain available
-            int numgains;
-            int gains[100];
+    printf("* Acquiring AD9361 phy channel 0\n");
 
-            numgains = rtlsdr_get_tuner_gains(Modes.dev, gains);
-            Modes.gain = gains[numgains-1];
-            fprintf(stderr, "Max available gain is: %.2f\n", Modes.gain/10.0);
-        }
-        rtlsdr_set_tuner_gain(Modes.dev, Modes.gain);
-        fprintf(stderr, "Setting gain to: %.2f\n", Modes.gain/10.0);
-    } else {
-        fprintf(stderr, "Using automatic gain control.\n");
+    struct iio_channel* phy_chn = iio_device_find_channel(iio_context_find_device(Modes.ctx, "ad9361-phy"), "voltage0", false);
+
+    iio_channel_attr_write(phy_chn, "rf_port_select", "A_BALANCED");
+    iio_channel_attr_write_longlong(phy_chn, "rf_bandwidth", MODES_DEFAULT_RATE);
+    iio_channel_attr_write_longlong(phy_chn, "sampling_frequency", MODES_DEFAULT_RATE);
+
+    struct iio_channel* lo_chn = iio_device_find_channel(iio_context_find_device(Modes.ctx, "ad9361-phy"), "altvoltage0", true);
+    iio_channel_attr_write_longlong(lo_chn, "frequency", Modes.freq);
+
+    printf("* Initializing AD9361 IIO streaming channels\n");
+
+    Modes.rx0_i = iio_device_find_channel(Modes.dev, "voltage0", false);
+    if (!Modes.rx0_i)
+        Modes.rx0_i= iio_device_find_channel(Modes.dev, "altvoltage0", false);
+
+    Modes.rx0_q = iio_device_find_channel(Modes.dev, "voltage1", false);
+    if (!Modes.rx0_q)
+        Modes.rx0_q = iio_device_find_channel(Modes.dev, "altvoltage1", false);
+
+    ad9361_set_bb_rate(iio_context_find_device(Modes.ctx, "ad9361-phy"), MODES_DEFAULT_RATE);
+
+    printf("* Enabling IIO streaming channels\n");
+
+    iio_channel_enable(Modes.rx0_i);
+    iio_channel_enable(Modes.rx0_q);
+
+    printf("* Creating non-cyclic IIO buffers \n");
+
+    Modes.rxbuf=iio_device_create_buffer(Modes.dev, MODES_ASYNC_BUF_SIZE/2, false);
+
+    if (!Modes.rxbuf) {
+        perror("Could not create RX buffer");
     }
-    rtlsdr_set_freq_correction(Modes.dev, Modes.ppm_error);
-    if (Modes.enable_agc) rtlsdr_set_agc_mode(Modes.dev, 1);
-    rtlsdr_set_center_freq(Modes.dev, Modes.freq);
-    rtlsdr_set_sample_rate(Modes.dev, MODES_DEFAULT_RATE);
-    rtlsdr_reset_buffer(Modes.dev);
-    fprintf(stderr, "Gain reported by device: %.2f\n",
-        rtlsdr_get_tuner_gain(Modes.dev)/10.0);
 }
+
+void modesCleanupPLUTOSDR() {
+    printf("* Destroying buffers\n");
+    if (Modes.rxbuf) { iio_buffer_destroy(Modes.rxbuf); }
+
+    printf("* Disabling streaming channels\n");
+    if (Modes.rx0_i) { iio_channel_disable(Modes.rx0_i); }
+    if (Modes.rx0_q) { iio_channel_disable(Modes.rx0_q); }
+
+    printf("* Destroying context\n");
+    if (Modes.ctx) { iio_context_destroy(Modes.ctx); }
+}
+
 //
 //=========================================================================
 //
@@ -252,21 +275,17 @@ void modesInitRTLSDR(void) {
 //
 // A Mutex is used to avoid races with the decoding thread.
 //
-void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
-
-    MODES_NOTUSED(ctx);
-
-    // Lock the data buffer variables before accessing them
+void plutosdrCallback(unsigned char *buf, uint32_t len) {
     pthread_mutex_lock(&Modes.data_mutex);
-
-    Modes.iDataIn &= (MODES_ASYNC_BUF_NUMBER-1); // Just incase!!!
-
     // Get the system time for this block
     ftime(&Modes.stSystemTimeRTL[Modes.iDataIn]);
 
-    if (len > MODES_ASYNC_BUF_SIZE) {len = MODES_ASYNC_BUF_SIZE;}
+    if (len > MODES_ASYNC_BUF_SIZE) len = MODES_ASYNC_BUF_SIZE;
 
-    // Queue the new data
+    for (size_t i = 0; i < len; i++){
+        buf[i]^= (uint8_t)0x80;
+    }
+
     Modes.pData[Modes.iDataIn] = (uint16_t *) buf;
     Modes.iDataIn    = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn + 1);
     Modes.iDataReady = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn - Modes.iDataOut);   
@@ -281,7 +300,7 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
       Modes.iDataReady = (MODES_ASYNC_BUF_NUMBER-1);   
       Modes.iDataLost++;
     }
- 
+
     // Signal to the other thread that new data is ready, and unlock
     pthread_cond_signal(&Modes.data_cond);
     pthread_mutex_unlock(&Modes.data_mutex);
@@ -351,9 +370,40 @@ void *readerThreadEntryPoint(void *arg) {
     MODES_NOTUSED(arg);
 
     if (Modes.filename == NULL) {
-        rtlsdr_read_async(Modes.dev, rtlsdrCallback, NULL,
-                              MODES_ASYNC_BUF_NUMBER,
-                              MODES_ASYNC_BUF_SIZE);
+        unsigned char *cb_buf;
+        size_t bufptr = 0;
+        cb_buf = (unsigned char*)malloc(MODES_ASYNC_BUF_SIZE * MODES_ASYNC_BUF_NUMBER * 2 * sizeof(int16_t));
+
+        while(!Modes.stop){
+            char *p_dat, *p_end;
+            ptrdiff_t p_inc;
+            ssize_t ret = iio_buffer_refill(Modes.rxbuf);
+
+            if (ret < 0) {
+                fprintf(stderr, "Unable to refill buffer: %s\n", strerror(-ret));
+                exit(-1);
+            }
+
+            p_inc = iio_buffer_step(Modes.rxbuf);
+            p_end = iio_buffer_end(Modes.rxbuf);
+            p_dat = iio_buffer_first(Modes.rxbuf, Modes.rx0_i);
+
+            // calculate size to check if we need wrap back to head
+            size_t len = (p_end - p_dat) / p_inc;
+            if (len + bufptr > MODES_ASYNC_BUF_SIZE * MODES_ASYNC_BUF_NUMBER) {
+                bufptr = 0;
+            }
+
+            for(p_dat = iio_buffer_first(Modes.rxbuf, Modes.rx0_i);p_dat < p_end; p_dat += p_inc){
+                const int16_t i = ((int16_t*)p_dat)[0]; // Real (I)
+                const int16_t q = ((int16_t*)p_dat)[1]; // Imag (Q)
+                cb_buf[bufptr*2]=i>>4;
+                cb_buf[bufptr*2+1]=q>>4;
+                bufptr++;
+            }
+
+            plutosdrCallback(cb_buf, len);
+        }
     } else {
         readDataFromFile();
     }
@@ -600,62 +650,8 @@ void backgroundTasks(void) {
 //
 int verbose_device_search(char *s)
 {
-	int i, device_count, device, offset;
-	char *s2;
-	char vendor[256], product[256], serial[256];
-	device_count = rtlsdr_get_device_count();
-	if (!device_count) {
-		fprintf(stderr, "No supported devices found.\n");
-		return -1;
-	}
-	fprintf(stderr, "Found %d device(s):\n", device_count);
-	for (i = 0; i < device_count; i++) {
-		rtlsdr_get_device_usb_strings(i, vendor, product, serial);
-		fprintf(stderr, "  %d:  %s, %s, SN: %s\n", i, vendor, product, serial);
-	}
-	fprintf(stderr, "\n");
-	/* does string look like raw id number */
-	device = (int)strtol(s, &s2, 0);
-	if (s2[0] == '\0' && device >= 0 && device < device_count) {
-		fprintf(stderr, "Using device %d: %s\n",
-			device, rtlsdr_get_device_name((uint32_t)device));
-		return device;
-	}
-	/* does string exact match a serial */
-	for (i = 0; i < device_count; i++) {
-		rtlsdr_get_device_usb_strings(i, vendor, product, serial);
-		if (strcmp(s, serial) != 0) {
-			continue;}
-		device = i;
-		fprintf(stderr, "Using device %d: %s\n",
-			device, rtlsdr_get_device_name((uint32_t)device));
-		return device;
-	}
-	/* does string prefix match a serial */
-	for (i = 0; i < device_count; i++) {
-		rtlsdr_get_device_usb_strings(i, vendor, product, serial);
-		if (strncmp(s, serial, strlen(s)) != 0) {
-			continue;}
-		device = i;
-		fprintf(stderr, "Using device %d: %s\n",
-			device, rtlsdr_get_device_name((uint32_t)device));
-		return device;
-	}
-	/* does string suffix match a serial */
-	for (i = 0; i < device_count; i++) {
-		rtlsdr_get_device_usb_strings(i, vendor, product, serial);
-		offset = strlen(serial) - strlen(s);
-		if (offset < 0) {
-			continue;}
-		if (strncmp(s, serial+offset, strlen(s)) != 0) {
-			continue;}
-		device = i;
-		fprintf(stderr, "Using device %d: %s\n",
-			device, rtlsdr_get_device_name((uint32_t)device));
-		return device;
-	}
-	fprintf(stderr, "No matching devices found.\n");
-	return -1;
+    MODES_NOTUSED(s);
+    return 0;
 }
 //
 //=========================================================================
@@ -769,8 +765,6 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[j],"--help")) {
             showHelp();
             exit(0);
-        } else if (!strcmp(argv[j],"--ppm") && more) {
-            Modes.ppm_error = atoi(argv[++j]);
         } else if (!strcmp(argv[j],"--quiet")) {
             Modes.quiet = 1;
         } else if (!strcmp(argv[j],"--mlat")) {
@@ -803,7 +797,7 @@ int main(int argc, char **argv) {
     if (Modes.net_only) {
         fprintf(stderr,"Net-only mode, no RTL device or file open.\n");
     } else if (Modes.filename == NULL) {
-        modesInitRTLSDR();
+        modesInitPLUTOSDR();
     } else {
         if (Modes.filename[0] == '-' && Modes.filename[1] == '\0') {
             Modes.fd = STDIN_FILENO;
@@ -887,8 +881,10 @@ int main(int argc, char **argv) {
     }
 
     if (Modes.filename == NULL) {
-        rtlsdr_cancel_async(Modes.dev);  // Cancel rtlsdr_read_async will cause data input thread to terminate cleanly
-        rtlsdr_close(Modes.dev);
+        void *ret;
+        Modes.stop = 1;
+        pthread_join(Modes.reader_thread, &ret);
+        modesCleanupPLUTOSDR();
     }
     pthread_cond_destroy(&Modes.data_cond);     // Thread cleanup
     pthread_mutex_destroy(&Modes.data_mutex);

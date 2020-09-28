@@ -57,7 +57,8 @@
     #include <ctype.h>
     #include <sys/stat.h>
     #include <sys/ioctl.h>
-    #include "rtl-sdr.h"
+    #include <iio.h>
+    #include <ad9361.h>
     #include "anet.h"
 #else
     #include "winstubs.h" //Put everything Windows specific in here
@@ -259,13 +260,16 @@ struct {                             // Internal state
     uint16_t       *maglut;          // I/Q -> Magnitude lookup table
     int             exit;            // Exit from the main loop when true
 
-    // RTLSDR
+    // PlutoSDR
     int           dev_index;
     int           gain;
     int           enable_agc;
-    rtlsdr_dev_t *dev;
-    int           freq;
-    int           ppm_error;
+    long long     freq;
+    int           stop;
+    struct iio_context *ctx;
+    struct iio_device *dev;
+    struct iio_channel *rx0_i, *rx0_q;
+    struct iio_buffer  *rxbuf;
 
     // Networking
     char           aneterr[ANET_ERR_LEN];

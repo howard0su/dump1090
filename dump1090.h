@@ -265,7 +265,6 @@ struct {                             // Internal state
     int           gain;
     int           enable_agc;
     long long     freq;
-    int           stop;
     struct iio_context *ctx;
     struct iio_device *dev;
     struct iio_channel *rx0_i, *rx0_q;

@@ -374,7 +374,7 @@ void *readerThreadEntryPoint(void *arg) {
         size_t bufptr = 0;
         cb_buf = (unsigned char*)malloc(MODES_ASYNC_BUF_SIZE * MODES_ASYNC_BUF_NUMBER * 2 * sizeof(int16_t));
 
-        while(!Modes.stop){
+        while(!Modes.exit){
             char *p_dat, *p_end;
             ptrdiff_t p_inc;
             ssize_t ret = iio_buffer_refill(Modes.rxbuf);
@@ -881,9 +881,7 @@ int main(int argc, char **argv) {
     }
 
     if (Modes.filename == NULL) {
-        void *ret;
-        Modes.stop = 1;
-        pthread_join(Modes.reader_thread, &ret);
+        pthread_join(Modes.reader_thread, NULL);
         modesCleanupPLUTOSDR();
     }
     pthread_cond_destroy(&Modes.data_cond);     // Thread cleanup
